@@ -37,7 +37,7 @@ TARGETS = [
     {"name": "Lazada ETB", "url": "https://www.lazada.com.ph/products/pdp-i15615776535-s133613012504.html"},
     {"name": "Lazada Booster Bundle", "url": "https://www.lazada.com.ph/products/pokemon-tcg-30th-celebration-booster-bundle-i15642615145-s133705007888.html"},
 ]
-CHECK_EVERY_MINUTES = 5
+CHECK_EVERY_MINUTES = 3
 TARGET_DELAY_SECONDS = 60  # wait between checking consecutive targets
 CAPTCHA_PAUSE_MINUTES = 30   # when a captcha appears, stop all checks for this long
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")  # or paste between the quotes
