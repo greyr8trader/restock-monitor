@@ -35,8 +35,8 @@ from playwright.sync_api import sync_playwright
 
 # ---------------- CONFIG ----------------
 TARGETS = [
-    {"name": "Lazada ETB", "url": "https://www.lazada.com.ph/products/pdp-i15615776535-s133613012504.html"},
-    {"name": "Lazada Booster Bundle", "url": "https://www.lazada.com.ph/products/pokemon-tcg-30th-celebration-booster-bundle-i15642615145-s133705007888.html"},
+    {"name": "Lazada ETB", "url": "https://lazada.com.ph"},
+    {"name": "Lazada Booster Bundle", "url": "https://lazada.com.ph"},
 ]
 CHECK_EVERY_MINUTES = 3
 TARGET_DELAY_SECONDS = 60  # wait between checking consecutive targets
@@ -77,7 +77,7 @@ def send_telegram(text):
         log("Telegram not configured; alert shown here only.")
         return
     data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         urllib.request.urlopen(url, data=data, timeout=20).read()
     except Exception as e:  # never let a failed alert stop the monitor
@@ -147,10 +147,9 @@ def check_lazada(page, url):
             return "out_of_stock", dom
         if any(BUY_RE.search(b) for b in dom["buttons"]):
             return "in_stock", dom
-    # Neither an "Out of stock" label nor a buy button: the live stock data never arrived.
-    dom["error"] = ("The page loaded without its live stock data (no 'Out of stock' label and "
-                    "no buy button). Lazada is probably throttling the monitor.")
-    dom["captcha"] = True  # treat like a captcha: pause everything
+    # Neither an "Out of stock" label nor a buy button: trigger proxy failover.
+    dom["error"] = ("No stock label and no buy button appeared. "
+                    "Proxy IP may be throttled or slow.")
     return "blocked", dom
 
 
@@ -234,263 +233,18 @@ def playwright_proxy(proxy_url):
 
 
 def is_proxy_transport_error(details):
-    """Identify proxy connection/authentication failures, not website challenges."""
+    """Identify proxy connection, timeout, auth, or throttled-IP failures."""
     error = str(details.get("error") or "").lower()
     markers = (
+        "no stock label",
+        "shopee product section did not load",
+        "page failed to load",
+        "timeout",
         "err_tunnel_connection_failed",
         "err_proxy_connection_failed",
         "err_no_supported_proxies",
         "err_proxy_certificate_invalid",
+        "err_connection_reset",
+        "err_connection_closed",
+        "err_timed_out",
         "proxy authentication required",
-        "proxy authentication failed",
-        "407 proxy",
-    )
-    return any(marker in error for marker in markers)
-
-
-def open_browser_context(playwright, proxy_index):
-    proxy_config = playwright_proxy(RESIDENTIAL_PROXIES[proxy_index])
-    options = {
-        "headless": HEADLESS,
-        "viewport": {"width": 1366, "height": 900},
-    }
-    if proxy_config:
-        options["proxy"] = proxy_config
-
-    context = playwright.chromium.launch_persistent_context(
-        str(PROFILE_DIR), **options
-    )
-    page = context.pages[0] if context.pages else context.new_page()
-    log(f"Connected browser using residential proxy "
-        f"{proxy_index + 1}/{len(RESIDENTIAL_PROXIES)}")
-    return context, page
-
-
-def test_proxy_route(page):
-    """
-    Test Chromium's actual route through the configured proxy.
-    Only transport/authentication failures trigger proxy failover.
-    A non-200 response from the IP-check service is logged as inconclusive,
-    because the proxy may be connected while that service is unavailable.
-    """
-    probe_url = "https://api.ipify.org?format=json"
-    try:
-        response = page.goto(probe_url, wait_until="domcontentloaded", timeout=20000)
-    except Exception as e:
-        error = str(e).splitlines()[0]
-        lower = error.lower()
-        transport_markers = (
-            "err_tunnel_connection_failed",
-            "err_proxy_connection_failed",
-            "err_no_supported_proxies",
-            "err_proxy_certificate_invalid",
-            "proxy authentication required",
-            "proxy authentication failed",
-            "407 proxy",
-        )
-        if any(marker in lower for marker in transport_markers):
-            return False, f"Proxy transport/authentication failure: {error}"
-        return None, f"Proxy probe inconclusive (not a recognized proxy failure): {error}"
-
-    status = response.status if response else None
-    try:
-        body = page.locator("body").inner_text(timeout=5000)
-    except Exception as e:
-        return None, f"Proxy probe inconclusive: could not read response body ({str(e).splitlines()[0]})."
-    if status == 407:
-        return False, "Proxy returned HTTP 407 (authentication required)."
-
-    match = re.search(r'"ip"\s*:\s*"([^"]+)"', body)
-    if status == 200 and match:
-        return True, f"Exit IP: {match.group(1)}"
-
-    return None, f"Proxy probe inconclusive: HTTP {status}; response={body[:160]!r}"
-
-
-def main():
-    once = "--once" in sys.argv
-    if not RESIDENTIAL_PROXIES:
-        raise SystemExit(
-            "Set RESIDENTIAL_PROXIES to a comma-separated list of authorized proxy URLs."
-        )
-
-    last = {}
-    proxy_index = 0
-
-    with sync_playwright() as p:
-        if "--test-proxies" in sys.argv:
-            passed = 0
-            for index in range(len(RESIDENTIAL_PROXIES)):
-                ctx = None
-                try:
-                    log(f"Testing proxy {index + 1}/{len(RESIDENTIAL_PROXIES)} inside Chromium...")
-                    ctx, probe_page = open_browser_context(p, index)
-                    probe_ok, probe_message = test_proxy_route(probe_page)
-                    if probe_ok is True:
-                        passed += 1
-                        log(f"RESULT proxy {index + 1}: PASS — {probe_message}")
-                    elif probe_ok is False:
-                        log(f"RESULT proxy {index + 1}: FAIL — {probe_message}")
-                    else:
-                        log(f"RESULT proxy {index + 1}: INCONCLUSIVE — {probe_message}")
-                except Exception as e:
-                    log(f"RESULT proxy {index + 1}: ERROR — {str(e).splitlines()[0]}")
-                finally:
-                    if ctx is not None:
-                        ctx.close()
-            log(f"Proxy test finished: {passed}/{len(RESIDENTIAL_PROXIES)} confirmed.")
-            return
-
-        while True:
-            log(f"Starting monitoring cycle; initial proxy "
-                f"{proxy_index + 1}/{len(RESIDENTIAL_PROXIES)}")
-
-            ctx = None
-            page = None
-            captcha_on = None
-            captcha_reason = "unknown"
-            all_proxies_failed = False
-
-            try:
-                # Verify Chromium's connection through the selected proxy before
-                # visiting Lazada. Rotate only on clear transport/auth failures.
-                tested = 0
-                while tested < len(RESIDENTIAL_PROXIES):
-                    ctx, page = open_browser_context(p, proxy_index)
-                    probe_ok, probe_message = test_proxy_route(page)
-
-                    if probe_ok is True:
-                        log(f"Proxy {proxy_index + 1}/{len(RESIDENTIAL_PROXIES)}: CONNECTED — {probe_message}")
-                        break
-
-                    if probe_ok is None:
-                        log(f"Proxy {proxy_index + 1}/{len(RESIDENTIAL_PROXIES)}: {probe_message}")
-                        log("Continuing to product checks; probe result alone is not enough to reject this proxy.")
-                        break
-
-                    log(f"Proxy {proxy_index + 1}/{len(RESIDENTIAL_PROXIES)}: FAILED — {probe_message}")
-                    if ctx is not None:
-                        ctx.close()
-                        ctx = None
-                        page = None
-
-                    tested += 1
-                    if tested >= len(RESIDENTIAL_PROXIES):
-                        msg = (
-                            f"PROXY ERROR: All {len(RESIDENTIAL_PROXIES)} configured proxies "
-                            f"failed Chromium's connection test. Last result: {probe_message}"
-                        )
-                        log(msg)
-                        send_telegram(msg)
-                        all_proxies_failed = True
-                        break
-
-                    failed_proxy = proxy_index + 1
-                    proxy_index = (proxy_index + 1) % len(RESIDENTIAL_PROXIES)
-                    msg = (
-                        f"PROXY ERROR: Proxy {failed_proxy}/{len(RESIDENTIAL_PROXIES)} "
-                        f"failed Chromium's connection test. Trying proxy "
-                        f"{proxy_index + 1}/{len(RESIDENTIAL_PROXIES)}."
-                    )
-                    log(msg)
-                    send_telegram(msg)
-
-                if not all_proxies_failed:
-                    for target_index, target in enumerate(TARGETS):
-                        status, details = check(page, target)
-                        log(f"{target['name']}: status={status}")
-
-                        # A transport failure during a product check can still
-                        # trigger failover. Do not rotate for CAPTCHA/site blocks.
-                        if is_proxy_transport_error(details):
-                            failed_proxy = proxy_index + 1
-                            if ctx is not None:
-                                ctx.close()
-                                ctx = None
-
-                            attempts = 1
-                            recovered = False
-                            while attempts < len(RESIDENTIAL_PROXIES):
-                                proxy_index = (proxy_index + 1) % len(RESIDENTIAL_PROXIES)
-                                log(f"Product-page proxy transport failure. Trying proxy "
-                                    f"{proxy_index + 1}/{len(RESIDENTIAL_PROXIES)}.")
-                                send_telegram(
-                                    f"PROXY ERROR: Proxy {failed_proxy}/{len(RESIDENTIAL_PROXIES)} "
-                                    f"failed during {target['name']}. Trying proxy "
-                                    f"{proxy_index + 1}/{len(RESIDENTIAL_PROXIES)}."
-                                )
-                                ctx, page = open_browser_context(p, proxy_index)
-                                probe_ok, probe_message = test_proxy_route(page)
-                                if probe_ok is True or probe_ok is None:
-                                    log(f"New proxy probe: {probe_message}")
-                                    status, details = check(page, target)
-                                    log(f"{target['name']} retry: status={status}")
-                                    recovered = True
-                                    break
-                                ctx.close()
-                                ctx = None
-                                attempts += 1
-
-                            if not recovered:
-                                msg = f"PROXY ERROR: No remaining proxies could recover the check for {target['name']}."
-                                log(msg)
-                                send_telegram(msg)
-                                all_proxies_failed = True
-                                break
-
-                        if once:
-                            print(json.dumps(details, indent=2, ensure_ascii=False))
-                            continue
-
-                        # Do not rotate proxies to work around CAPTCHA/verification.
-                        if details.get("captcha"):
-                            captcha_on = target["name"]
-                            captcha_reason = details.get("error") or "unknown"
-                            break
-
-                        prev = last.get(target["url"])
-                        if status != prev and not (status == "out_of_stock" and prev is None):
-                            msg = message_for(target, status, details)
-                            log(" ".join(msg.splitlines()))
-                            send_telegram(msg)
-                            if status == "in_stock":
-                                beep()
-                        last[target["url"]] = status
-
-                        if target_index < len(TARGETS) - 1:
-                            log(f"Waiting {TARGET_DELAY_SECONDS} seconds before the next target.")
-                            time.sleep(TARGET_DELAY_SECONDS)
-
-                if once:
-                    return
-
-            except KeyboardInterrupt:
-                log("Stopped.")
-                return
-            except Exception as e:
-                log(f"Monitoring cycle failed: {e}")
-                send_telegram(f"Restock monitor cycle failed: {e}")
-            finally:
-                if ctx is not None:
-                    ctx.close()
-
-            if captcha_on:
-                msg = "\\n".join([
-                    f"CAPTCHA / VERIFICATION CHALLENGE on {captcha_on}.",
-                    f"Checks are paused for {CAPTCHA_PAUSE_MINUTES} minutes.",
-                    f"Reason: {captcha_reason}",
-                    "The monitor will not switch proxies to bypass the challenge.",
-                ])
-                log(msg)
-                send_telegram(msg)
-                time.sleep(CAPTCHA_PAUSE_MINUTES * 60)
-                send_telegram("Restock monitor is retrying after the challenge pause.")
-                continue
-
-            # Advance to the next session for the next cycle.
-            proxy_index = (proxy_index + 1) % len(RESIDENTIAL_PROXIES)
-            time.sleep(CHECK_EVERY_MINUTES * 60)
-
-
-if __name__ == "__main__":
-    main()
