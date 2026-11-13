@@ -248,3 +248,8 @@ def is_proxy_transport_error(details):
         "err_connection_closed",
         "err_timed_out",
         "proxy authentication required",
+        "proxy authentication failed",
+        "407 proxy",
+    )
+    return any(marker in error for marker in markers)
+
