@@ -1,127 +1,96 @@
-    if proxy_config:
-        options["proxy"] = proxy_config
+"""
+Restock monitor for Lazada and Shopee - supports rotating authorized proxies.
 
-    ctx = playwright.chromium.launch_persistent_context(
-        str(PROFILE_DIR), **options
-    )
-    page = ctx.pages[0] if ctx.pages else ctx.new_page()
-    log(f"Using residential proxy {proxy_index + 1}/{len(RESIDENTIAL_PROXIES)}")
-    return ctx, page
+Opens each product page in Chrome every few minutes, reads
+the stock label / buy buttons, and sends a Telegram message when an item
+becomes buyable. Also sends a Telegram error if a site blocks it.
+
+Setup (once):
+    python -m pip install playwright
+    python -m playwright install chromium
+
+Set RESIDENTIAL_PROXIES to comma-separated proxy URLs before running.
+
+Run:
+    python restock_monitor.py            # keeps checking
+    python restock_monitor.py --once     # single check of every item, prints details
+
+If a site shows a slider/captcha, the script sends a Telegram message, pauses
+all checks for CAPTCHA_PAUSE_MINUTES, then messages again when it restarts.
+Solve the slider yourself in the monitor's Chrome window; cookies are kept.
+"""
+import json
+import os
+import re
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+from playwright.sync_api import TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
+
+# ---------------- CONFIG ----------------
+TARGETS = [
+    {"name": "Lazada ETB", "url": "https://www.lazada.com.ph/products/pdp-i15615776535-s133613012504.html"},
+    {"name": "Lazada Booster Bundle", "url": "https://www.lazada.com.ph/products/pokemon-tcg-30th-celebration-booster-bundle-i15642615145-s133705007888.html"},
+]
+CHECK_EVERY_MINUTES = 3
+TARGET_DELAY_SECONDS = 60  # wait between checking consecutive targets
+CAPTCHA_PAUSE_MINUTES = 30   # when a captcha appears, stop all checks for this long
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")  # or paste between the quotes
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")      # or paste between the quotes
+PROFILE_DIR = Path(__file__).with_name("browser-profile")      # keeps cookies/logins between runs
+HEADLESS = os.environ.get("HEADLESS") == "1"
+
+# Comma-separated proxy URLs, for example:
+# http://username:password@host1:10000,http://username:password@host2:10000
+# Keep credentials in environment variables, not in source control.
+RESIDENTIAL_PROXIES = [
+    value.strip()
+    for value in os.environ.get("RESIDENTIAL_PROXIES", "").split(",")
+    if value.strip()
+]
+# ----------------------------------------
+
+# Optional: put the bot token on line 1 and the chat ID on line 2 of a file named
+# telegram.txt next to this script. Then script updates never wipe your settings.
+_tg_file = Path(__file__).with_name("telegram.txt")
+if _tg_file.exists():
+    _lines = [l.strip() for l in _tg_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    if len(_lines) >= 2:
+        TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID = _lines[0], _lines[1]
+
+BUY_RE = re.compile(r"add to cart|buy now|pre-?order", re.I)
+OOS_RE = re.compile(r"out of stock|sold out", re.I)
 
 
-def main():
-    once = "--once" in sys.argv
-    if not RESIDENTIAL_PROXIES:
-        raise SystemExit(
-            "Set RESIDENTIAL_PROXIES to a comma-separated list of authorized proxy URLs."
-        )
+def log(msg):
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
-    last = {}
-    proxy_index = 0
 
-    with sync_playwright() as p:
-        while True:
-            log(f"Starting monitoring cycle with residential proxy "
-                f"{proxy_index + 1}/{len(RESIDENTIAL_PROXIES)}")
+def send_telegram(text):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        log("Telegram not configured; alert shown here only.")
+        return
+    data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        urllib.request.urlopen(url, data=data, timeout=20).read()
+    except Exception as e:  # never let a failed alert stop the monitor
+        log(f"Telegram send failed: {e}")
 
-            ctx = None
-            captcha_on = None
-            cycle_failed = False
 
-            try:
-                ctx, page = launch_context(p, proxy_index)
+def beep():
+    try:
+        import winsound
+        for _ in range(3):
+            winsound.Beep(1200, 400)
+    except Exception:
+        print("\a", end="", flush=True)
 
-                for target_index, target in enumerate(TARGETS):
-                    # Retry this same target on the next proxy only when the
-                    # failure is clearly a proxy transport/authentication error.
-                    proxy_attempts = 0
-                    while True:
-                        status, details = check(page, target)
-                        log(f"{target['name']}: status={status}")
 
-                        if not is_proxy_connection_error(details):
-                            break
-
-                        failed_proxy = proxy_index + 1
-                        if ctx is not None:
-                            ctx.close()
-                            ctx = None
-
-                        proxy_attempts += 1
-                        if proxy_attempts >= len(RESIDENTIAL_PROXIES):
-                            msg = (
-                                f"PROXY ERROR: All {len(RESIDENTIAL_PROXIES)} configured "
-                                f"proxies failed while checking {target['name']}. "
-                                f"Last error: {details.get('error', 'unknown')}"
-                            )
-                            log(msg)
-                            send_telegram(msg)
-                            cycle_failed = True
-                            break
-
-                        proxy_index = (proxy_index + 1) % len(RESIDENTIAL_PROXIES)
-                        msg = (
-                            f"Proxy {failed_proxy}/{len(RESIDENTIAL_PROXIES)} failed "
-                            f"while checking {target['name']}. Trying proxy "
-                            f"{proxy_index + 1}/{len(RESIDENTIAL_PROXIES)} and retrying "
-                            f"the same target."
-                        )
-                        log(msg)
-                        send_telegram(msg)
-                        ctx, page = launch_context(p, proxy_index)
-
-                    if cycle_failed:
-                        break
-
-                    if once:
-                        print(json.dumps(details, indent=2, ensure_ascii=False))
-                        continue
-
-                    # CAPTCHA and verification challenges do not trigger proxy
-                    # rotation; the monitor pauses rather than bypassing them.
-                    if details.get("captcha"):
-                        captcha_on = target["name"]
-                        captcha_reason = details.get("error") or "unknown"
-                        break
-
-                    prev = last.get(target["url"])
-                    if status != prev and not (status == "out_of_stock" and prev is None):
-                        msg = message_for(target, status, details)
-                        log(msg.replace("\n", " "))
-                        send_telegram(msg)
-                        if status == "in_stock":
-                            beep()
-                    last[target["url"]] = status
-
-                    if target_index < len(TARGETS) - 1:
-                        log(f"Waiting {TARGET_DELAY_SECONDS} seconds before the next target.")
-                        time.sleep(TARGET_DELAY_SECONDS)
-
-                if once:
-                    return
-
-            except KeyboardInterrupt:
-                log("Stopped.")
-                return
-            except Exception as e:
-                log(f"Monitoring cycle failed: {e}")
-                send_telegram(f"Restock monitor cycle failed: {e}")
-                cycle_failed = True
-            finally:
-                if ctx is not None:
-                    ctx.close()
-
-            if captcha_on:
-                msg = (f"CAPTCHA / VERIFICATION CHALLENGE on {captcha_on}. "
-                       f"Checks are paused for {CAPTCHA_PAUSE_MINUTES} minutes.\n"
-                       f"Reason: {captcha_reason}\n"
-                       "The monitor will not switch proxies to bypass a challenge.")
-                log(msg)
-                send_telegram(msg)
-                time.sleep(CAPTCHA_PAUSE_MINUTES * 60)
-                send_telegram("Restock monitor is retrying after the challenge pause.")
-                continue
-
-            # Continue the round-robin sequence after the last proxy used.
-            proxy_index = (proxy_index + 1) % len(RESIDENTIAL_PROXIES)
-            time.sleep(CHECK_EVERY_MINUTES * 60)
+def load(page, url):
+    """Open the page and give it time to load its live data. Returns an error string or None."""
