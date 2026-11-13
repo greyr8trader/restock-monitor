@@ -94,3 +94,295 @@ def beep():
 
 def load(page, url):
     """Open the page and give it time to load its live data. Returns an error string or None."""
+    try:
+        page.goto(url, wait_until="load", timeout=45000)
+    except Exception as e:
+        return "Page failed to load: " + str(e).splitlines()[0]
+    try:
+        page.wait_for_load_state("networkidle", timeout=20000)
+    except PWTimeout:
+        pass
+    page.wait_for_timeout(4000)
+    return None
+
+
+# ---------- Lazada ----------
+LAZADA_JS = """() => {
+    const q = document.querySelector('#module_quantity-input');
+    const btns = Array.from(document.querySelectorAll('button, .pdp-button'))
+        .map(b => (b.innerText || '').trim()).filter(Boolean);
+    return { url: location.href, title: document.title,
+             quantityText: q ? q.innerText.trim() : null,
+             buttons: Array.from(new Set(btns)).slice(0, 30) };
+}"""
+
+
+def check_lazada(page, url):
+    err = load(page, url)
+    if err:
+        return "blocked", {"error": err}
+    # The page first shows a placeholder; wait until Lazada's live data has filled in
+    # either the "Out of stock" label or a real button (buy / wishlist).
+    dom = page.evaluate(LAZADA_JS)
+    deadline = time.time() + 25
+    while True:
+        if re.search(r"punish|captcha", dom["url"] + " " + dom["title"], re.I):
+            dom["error"] = "Lazada showed its captcha / verification page."
+            dom["captcha"] = True
+            return "blocked", dom
+        oos = bool(OOS_RE.search(dom["quantityText"] or ""))
+        buy = any(BUY_RE.search(b) for b in dom["buttons"])
+        if oos or buy or time.time() > deadline:
+            break
+        page.wait_for_timeout(1500)
+        dom = page.evaluate(LAZADA_JS)
+    if oos:
+        return "out_of_stock", dom
+    if buy:
+        # read again after a pause, so a half-loaded page can't cause a false alert
+        page.wait_for_timeout(5000)
+        dom = page.evaluate(LAZADA_JS)
+        if OOS_RE.search(dom["quantityText"] or ""):
+            return "out_of_stock", dom
+        if any(BUY_RE.search(b) for b in dom["buttons"]):
+            return "in_stock", dom
+    # Neither an "Out of stock" label nor a buy button: the live stock data never arrived.
+    dom["error"] = ("The page loaded without its live stock data (no 'Out of stock' label and "
+                    "no buy button). Lazada is probably throttling the monitor.")
+    dom["captcha"] = True  # treat like a captcha: pause everything
+    return "blocked", dom
+
+
+# ---------- Shopee ----------
+SHOPEE_JS = """() => {
+    const buy = /^(add to cart|buy now|pre-?order.*)$/i;
+    const buttons = Array.from(document.querySelectorAll('button'))
+        .map(b => ({ text: (b.innerText || '').trim(),
+                     disabled: b.disabled || b.getAttribute('aria-disabled') === 'true' }))
+        .filter(b => buy.test(b.text));
+    const text = document.body ? document.body.innerText : '';
+    const m = text.match(/(\\d[\\d,]*)\\s+pieces?\\s+available/i);
+    return { url: location.href, title: document.title, buyButtons: buttons,
+             piecesAvailable: m ? parseInt(m[1].replace(/,/g, ''), 10) : null,
+             textLength: text.length };
+}"""
+
+
+def check_shopee(page, url):
+    err = load(page, url)
+    if err:
+        return "blocked", {"error": err}
+    dom = page.evaluate(SHOPEE_JS)
+    if re.search(r"/buyer/login|/verify/|captcha", dom["url"], re.I):
+        dom["error"] = ("Shopee redirected to its login / verification page. "
+                        "Log in or complete the check in the monitor's Chrome window.")
+        dom["captcha"] = True
+        return "blocked", dom
+    if not dom["buyButtons"]:
+        dom["error"] = "Shopee product section did not load (no Buy Now / Add To Cart button found)."
+        return "blocked", dom
+    enabled = [b for b in dom["buyButtons"] if not b["disabled"]]
+    if dom["piecesAvailable"] == 0 or not enabled:
+        return "out_of_stock", dom
+    return "in_stock", dom
+
+
+def check(page, target):
+    fn = check_shopee if "shopee." in target["url"] else check_lazada
+    try:
+        return fn(page, target["url"])
+    except Exception as e:
+        return "blocked", {"error": "Script error: " + str(e).splitlines()[0]}
+
+
+def message_for(target, status, details):
+    site, url = target["name"], target["url"]
+    title = re.sub(r"\s*\|\s*(Lazada|Shopee).*$", "", details.get("title") or "item").strip()
+    if status == "in_stock":
+        return f"BACK IN STOCK on {site}: {title}\n{url}"
+    if status == "out_of_stock":
+        return f"{site} monitor: {title} is out of stock again.\n{url}"
+    if status == "blocked":
+        return (f"ERROR: {site} monitor is BLOCKED and cannot see stock.\n"
+                f"Reason: {details.get('error') or 'unknown'}\n"
+                "Open the monitor's Chrome window on your PC and sort it out there; "
+                "it retries at the next interval.")
+    return (f"{site} monitor could not confirm stock, but the page no longer says "
+            f"'Out of stock'. Buttons seen: {' | '.join(details.get('buttons') or []) or 'none'}. "
+            f"Check it now:\n{url}")
+
+
+def playwright_proxy(proxy_url):
+    """Convert an HTTP(S) proxy URL into Playwright's proxy configuration."""
+    if not proxy_url:
+        return None
+
+    parsed = urllib.parse.urlsplit(proxy_url)
+    if not parsed.scheme or not parsed.hostname or not parsed.port:
+        raise ValueError(
+            "Each proxy must be a full URL such as "
+            "http://username:password@host:port"
+        )
+
+    config = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+    if parsed.username is not None:
+        config["username"] = urllib.parse.unquote(parsed.username)
+    if parsed.password is not None:
+        config["password"] = urllib.parse.unquote(parsed.password)
+    return config
+
+
+def is_proxy_transport_error(details):
+    """Identify proxy connection/authentication failures, not website challenges."""
+    error = str(details.get("error") or "").lower()
+    markers = (
+        "err_tunnel_connection_failed",
+        "err_proxy_connection_failed",
+        "err_no_supported_proxies",
+        "err_proxy_certificate_invalid",
+        "proxy authentication required",
+        "proxy authentication failed",
+        "407 proxy",
+    )
+    return any(marker in error for marker in markers)
+
+
+def open_browser_context(playwright, proxy_index):
+    proxy_config = playwright_proxy(RESIDENTIAL_PROXIES[proxy_index])
+    options = {
+        "headless": HEADLESS,
+        "viewport": {"width": 1366, "height": 900},
+    }
+    if proxy_config:
+        options["proxy"] = proxy_config
+
+    context = playwright.chromium.launch_persistent_context(
+        str(PROFILE_DIR), **options
+    )
+    page = context.pages[0] if context.pages else context.new_page()
+    log(f"Connected browser using residential proxy "
+        f"{proxy_index + 1}/{len(RESIDENTIAL_PROXIES)}")
+    return context, page
+
+
+def main():
+    once = "--once" in sys.argv
+    if not RESIDENTIAL_PROXIES:
+        raise SystemExit(
+            "Set RESIDENTIAL_PROXIES to a comma-separated list of authorized proxy URLs."
+        )
+
+    last = {}
+    proxy_index = 0
+
+    with sync_playwright() as p:
+        while True:
+            log(f"Starting monitoring cycle with residential proxy "
+                f"{proxy_index + 1}/{len(RESIDENTIAL_PROXIES)}")
+
+            ctx = None
+            captcha_on = None
+            captcha_reason = "unknown"
+            all_proxies_failed = False
+
+            try:
+                ctx, page = open_browser_context(p, proxy_index)
+
+                for target_index, target in enumerate(TARGETS):
+                    attempts_for_target = 0
+
+                    while True:
+                        status, details = check(page, target)
+                        log(f"{target['name']}: status={status}")
+
+                        if not is_proxy_transport_error(details):
+                            break
+
+                        failed_proxy = proxy_index + 1
+                        if ctx is not None:
+                            ctx.close()
+                            ctx = None
+
+                        attempts_for_target += 1
+                        if attempts_for_target >= len(RESIDENTIAL_PROXIES):
+                            msg = (
+                                f"PROXY ERROR: All {len(RESIDENTIAL_PROXIES)} "
+                                f"configured proxies failed while checking {target['name']}. "
+                                f"Last error: {details.get('error', 'unknown')}"
+                            )
+                            log(msg)
+                            send_telegram(msg)
+                            all_proxies_failed = True
+                            break
+
+                        proxy_index = (proxy_index + 1) % len(RESIDENTIAL_PROXIES)
+                        msg = (
+                            f"PROXY ERROR: Proxy {failed_proxy}/{len(RESIDENTIAL_PROXIES)} "
+                            f"failed while checking {target['name']}. Trying proxy "
+                            f"{proxy_index + 1}/{len(RESIDENTIAL_PROXIES)} and retrying "
+                            f"the same target."
+                        )
+                        log(msg)
+                        send_telegram(msg)
+                        ctx, page = open_browser_context(p, proxy_index)
+
+                    if all_proxies_failed:
+                        break
+
+                    if once:
+                        print(json.dumps(details, indent=2, ensure_ascii=False))
+                        continue
+
+                    # Do not rotate proxies to work around CAPTCHA/verification.
+                    if details.get("captcha"):
+                        captcha_on = target["name"]
+                        captcha_reason = details.get("error") or "unknown"
+                        break
+
+                    prev = last.get(target["url"])
+                    if status != prev and not (status == "out_of_stock" and prev is None):
+                        msg = message_for(target, status, details)
+                        log(" ".join(msg.splitlines()))
+                        send_telegram(msg)
+                        if status == "in_stock":
+                            beep()
+                    last[target["url"]] = status
+
+                    if target_index < len(TARGETS) - 1:
+                        log(f"Waiting {TARGET_DELAY_SECONDS} seconds before the next target.")
+                        time.sleep(TARGET_DELAY_SECONDS)
+
+                if once:
+                    return
+
+            except KeyboardInterrupt:
+                log("Stopped.")
+                return
+            except Exception as e:
+                log(f"Monitoring cycle failed: {e}")
+                send_telegram(f"Restock monitor cycle failed: {e}")
+            finally:
+                if ctx is not None:
+                    ctx.close()
+
+            if captcha_on:
+                msg = "\n".join([
+                    f"CAPTCHA / VERIFICATION CHALLENGE on {captcha_on}.",
+                    f"Checks are paused for {CAPTCHA_PAUSE_MINUTES} minutes.",
+                    f"Reason: {captcha_reason}",
+                    "The monitor will not switch proxies to bypass the challenge.",
+                ])
+                log(msg)
+                send_telegram(msg)
+                time.sleep(CAPTCHA_PAUSE_MINUTES * 60)
+                send_telegram("Restock monitor is retrying after the challenge pause.")
+                continue
+
+            # Move on from the last proxy used in this cycle. After an all-proxy
+            # failure, this naturally starts the next cycle at the first proxy again.
+            proxy_index = (proxy_index + 1) % len(RESIDENTIAL_PROXIES)
+            time.sleep(CHECK_EVERY_MINUTES * 60)
+
+
+if __name__ == "__main__":
+    main()
