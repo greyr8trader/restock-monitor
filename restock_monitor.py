@@ -32,8 +32,8 @@ from playwright.sync_api import sync_playwright
 
 # ---------------- CONFIG ----------------
 TARGETS = [
-    {"name": "Lazada ETB", "url": "https://www.lazada.com.ph/products/pdp-i15615776535-s133613012504.html"},
-    {"name": "Lazada Booster Bundle", "url": "https://www.lazada.com.ph/products/pokemon-tcg-30th-celebration-booster-bundle-i15642615145-s133705007888.html"},
+    {"name": "Sylveon", "url": "https://s.lazada.com.ph/s.ZFcVDv"},
+    {"name": "Greninja", "url": "https://s.lazada.com.ph/s.ZFcVEQ"},
 ]
 CHECK_EVERY_MINUTES = 3
 TARGET_DELAY_SECONDS = 60  # wait between checking consecutive targets
